@@ -1,0 +1,37 @@
+# systemd unit for running the bot 24/7 with auto-restart on Ubuntu (AWS Tokyo).
+#
+# Install:
+#   sudo cp deploy/hf-trading-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hf-trading-bot
+#
+# Watch logs:   journalctl -u hf-trading-bot -f
+# Stop:         sudo systemctl stop hf-trading-bot
+# Restart:      sudo systemctl restart hf-trading-bot
+#
+# NOTE: the interactive entry-mode menu (custom range vs. watch/confirm) needs
+# a terminal. For unattended 24/7 running, choose the DEFAULT watch/confirm
+# mode by piping "2" into it (already wired below). To run with a custom price
+# range, start it by hand in a tmux/screen session instead of via systemd.
+
+[Unit]
+Description=Binance HF Futures Trading Bot (Rust)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/hf-bot-rust
+# Entry mode comes from .env (ENTRY_MODE=auto|custom) — no interactive prompt.
+ExecStart=/home/ubuntu/hf-bot-rust/target/release/hf_trading_bot
+# on-failure (NOT always): after take-profit the bot exits cleanly and must STAY
+# stopped until the user starts it again. Only restart on a crash.
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+# Optional: pin the bot to a dedicated CPU core (client's taskset idea).
+# ExecStart=/usr/bin/taskset -c 1 /home/ubuntu/hf-bot-rust/target/release/hf_trading_bot
+
+[Install]
+WantedBy=multi-user.target
