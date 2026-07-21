@@ -29,7 +29,6 @@ use crate::config::TradingConfig;
 use crate::events::{Event, OrderUpdate};
 use crate::rest::{get_f64, get_i64, ApiError, BinanceRest, SymbolFilters};
 
-const MIN_NOTIONAL: f64 = 5.1; // Binance min notional is 5 USDT; small buffer.
 
 pub struct TradingBot {
     config: TradingConfig,
@@ -375,6 +374,20 @@ impl TradingBot {
                 }
             }
             Err(e) => {
+                // -4164: the order value is under this symbol's minimum. Say
+                // what to change rather than repeating Binance's wording —
+                // every symbol has its own minimum (BTC is 50 USDT, most
+                // small-cap coins are 5).
+                if let Some(api) = e.downcast_ref::<ApiError>() {
+                    if api.code == -4164 {
+                        error!(
+                            "{} needs a bigger order than POSITION_SIZE={} at {}x leverage. \
+                             Raise POSITION_SIZE in .env (or the leverage) and restart. ({e})",
+                            self.config.symbol, self.config.position_size, self.config.leverage
+                        );
+                        return;
+                    }
+                }
                 error!("Error opening {direction} position: {e}");
                 return;
             }
@@ -897,8 +910,12 @@ impl TradingBot {
     // that a previous dev fixed — including the min-notional bump)
     // -----------------------------------------------------------------
     fn calculate_quantity(&self, price: f64) -> Result<String> {
+        // Per-symbol minimum, read from the exchange at start-up. BTC is 50
+        // USDT, ETH 20, most alt-coins 5 — a hardcoded value silently breaks
+        // whenever the user switches to a bigger-minimum symbol.
+        let min_notional = self.filters.min_notional * 1.02; // small buffer
         let raw_quantity = self.config.position_size / price;
-        let min_quantity = MIN_NOTIONAL / price;
+        let min_quantity = min_notional / price;
         let mut quantity = raw_quantity.max(min_quantity);
 
         let step = self.filters.step_size;
@@ -909,15 +926,25 @@ impl TradingBot {
         }
 
         // Bump up if flooring dropped us below the exchange minimum.
-        if quantity * price < MIN_NOTIONAL {
-            quantity = (MIN_NOTIONAL / price / step).ceil() * step;
+        if quantity * price < min_notional {
+            quantity = (min_notional / price / step).ceil() * step;
         }
 
         let formatted = self.format_quantity(quantity);
         let final_notional = formatted.parse::<f64>().unwrap_or(0.0) * price;
-        if final_notional < MIN_NOTIONAL {
+        // The exchange minimum can force a bigger trade than POSITION_SIZE asks
+        // for. Never let that happen silently — it is the user's money.
+        if final_notional > self.config.position_size * 1.05 {
+            warn!(
+                "{} will trade {:.2} USDT, not POSITION_SIZE={} — this symbol's minimum order is {:.2} USDT.",
+                self.config.symbol, final_notional, self.config.position_size, self.filters.min_notional
+            );
+        }
+        if final_notional < min_notional {
             return Err(anyhow::anyhow!(
-                "Quantity {formatted} at price {price} gives notional {final_notional:.4} USDT, below minimum {MIN_NOTIONAL}"
+                "{} requires orders of at least {:.2} USDT; POSITION_SIZE={} gives only {final_notional:.2} USDT. \
+                 Raise POSITION_SIZE in .env.",
+                self.config.symbol, self.filters.min_notional, self.config.position_size
             ));
         }
         Ok(formatted)

@@ -35,6 +35,10 @@ pub struct SymbolFilters {
     pub step_size: f64,
     pub price_precision: usize,
     pub quantity_precision: usize,
+    /// Smallest order value this symbol accepts, in USDT. Varies per symbol
+    /// (5 for most alt-coins, 50 for BTC, 20 for ETH), so it must be read from
+    /// the exchange rather than assumed.
+    pub min_notional: f64,
 }
 
 pub struct BinanceRest {
@@ -172,12 +176,15 @@ impl BinanceRest {
 
         let tick_size = filter_field(filters, "PRICE_FILTER", "tickSize")?;
         let step_size = filter_field(filters, "LOT_SIZE", "stepSize")?;
+        // MIN_NOTIONAL is absent on a few symbols; 5 is Binance's floor.
+        let min_notional = filter_field(filters, "MIN_NOTIONAL", "notional").unwrap_or(5.0);
 
         Ok(SymbolFilters {
             tick_size,
             step_size,
             price_precision: precision_from(tick_size),
             quantity_precision: precision_from(step_size),
+            min_notional,
         })
     }
 
