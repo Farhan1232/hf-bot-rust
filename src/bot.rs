@@ -418,9 +418,11 @@ impl TradingBot {
 
     /// Place the stop loss as a real exchange order via the CONDITIONAL Algo
     /// endpoint (required since Binance's 2025-12-09 migration — the old
-    /// endpoint returns -4120 for stop orders). Retries with a wider buffer on
-    /// -2021 ("would immediately trigger"). Only if the exchange truly refuses
-    /// it does the bot fall back to a bot-side software stop.
+    /// endpoint returns -4120 for stop orders). The trigger is always measured
+    /// from the position's real entry fill, so the loss is exactly
+    /// STOP_LOSS_PERCENTAGE; a -2021 ("would immediately trigger") retry may
+    /// shift it by a tick or two but never by another whole percentage, and
+    /// never past 2x the configured distance.
     async fn place_stop_loss(&mut self, entry_price: f64) -> Result<()> {
         let quantity = self.calculate_quantity(entry_price)?;
         let max_retries = 5;
@@ -451,6 +453,24 @@ impl TradingBot {
         let max_dist = (entry_price * pct / 100.0) * 2.0;
 
         let mut sl_price = self.round_to_tick(target);
+        // A stop closer than one tick would round back onto the entry price and
+        // be rejected. Push it to the nearest legal tick and say so, because it
+        // means the configured percentage is finer than this symbol can express.
+        if (sl_price - entry_price).abs() < self.filters.tick_size {
+            sl_price = self.round_to_tick(if is_long {
+                entry_price - self.filters.tick_size
+            } else {
+                entry_price + self.filters.tick_size
+            });
+            warn!(
+                "STOP_LOSS_PERCENTAGE={pct}% is smaller than one tick ({}) on {} — \
+                 using the closest possible stop {} ({:.3}%).",
+                self.filters.tick_size,
+                self.config.symbol,
+                self.format_price(sl_price),
+                (sl_price - entry_price).abs() / entry_price * 100.0
+            );
+        }
         for attempt in 1..=max_retries {
             let trigger = self.format_price(sl_price);
             match self

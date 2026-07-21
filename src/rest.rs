@@ -276,6 +276,12 @@ impl BinanceRest {
             ("type", "STOP_MARKET".into()),
             ("triggerPrice", trigger_price.into()),
             ("quantity", quantity.into()),
+            // Trigger off the LAST traded price, the same price the entry was
+            // filled at and the same one shown in the UI. Left unset, Binance
+            // may evaluate the trigger against the MARK price, which on thin
+            // symbols can sit ~0.5% away from last — that makes every stop
+            // tighter than the gap look "already triggered" (-2021).
+            ("workingType", "CONTRACT_PRICE".into()),
         ];
         if reduce_only {
             params.push(("reduceOnly", "true".into()));
