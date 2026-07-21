@@ -27,7 +27,7 @@ use crate::rest::BinanceRest;
 
 /// Bump this whenever a change ships, so the running binary can be identified
 /// from its start-up line — a stale binary is otherwise indistinguishable.
-const BUILD_VERSION: &str = "2026-07-21.11";
+const BUILD_VERSION: &str = "2026-07-22.1";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -128,6 +128,12 @@ async fn main() -> Result<()> {
     bot.log_startup();
     info!("Bot is starting... Press Ctrl+C to stop");
 
+    // Both signals must be PERSISTENT streams. Creating the future fresh on
+    // every loop pass (as tokio::signal::ctrl_c() does) drops any signal that
+    // arrives while the loop is busy awaiting an order — which made Ctrl+C need
+    // a dozen presses to be noticed during heavy trading.
+    let mut interrupt =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -145,7 +151,7 @@ async fn main() -> Result<()> {
                     None => break,
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = interrupt.recv() => {
                 info!("Ctrl+C received");
                 break;
             }

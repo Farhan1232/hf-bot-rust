@@ -448,9 +448,24 @@ impl TradingBot {
             _ => return Ok(()),
         };
         let tp_price = self.format_price(self.round_to_tick(raw_tp));
-        self.rest
+        // Straight after a flip the new position can take a moment to register,
+        // and a reduce-only order against a position Binance cannot see yet is
+        // rejected with -2022. One short retry, otherwise the position runs with
+        // no take profit at all.
+        let mut placed = self
+            .rest
             .create_limit_order(&self.config.symbol, side, &tp_price, &quantity, true)
-            .await?;
+            .await;
+        if let Err(e) = &placed {
+            if matches!(e.downcast_ref::<ApiError>(), Some(a) if a.code == -2022) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                placed = self
+                    .rest
+                    .create_limit_order(&self.config.symbol, side, &tp_price, &quantity, true)
+                    .await;
+            }
+        }
+        placed?;
         info!(
             "Take profit ({:?}) placed at {tp_price} (entry {entry_price})",
             self.current_position
@@ -496,6 +511,7 @@ impl TradingBot {
         // it — so the bot closes at market instead (see the -2021 arm below).
         let max_dist = (entry_price * pct / 100.0) + 2.0 * self.filters.tick_size;
 
+        let mut nudge_ticks = 2.0_f64;
         let mut sl_price = self.round_to_tick(target);
         // A stop closer than one tick would round back onto the entry price and
         // be rejected. Push it to the nearest legal tick and say so, because it
@@ -541,9 +557,12 @@ impl TradingBot {
                                 .symbol_price(&self.config.symbol)
                                 .await
                                 .unwrap_or(entry_price);
-                            // Re-place just past the current price (2 ticks), but
-                            // only while that is still inside the risk ceiling.
-                            let nudge = 2.0 * self.filters.tick_size;
+                            // Re-place past the current price, doubling the gap
+                            // each attempt (2, 4, 8, 16 ticks). A fixed nudge
+                            // just gets rejected again at the same price and
+                            // burns every retry for nothing.
+                            let nudge = nudge_ticks * self.filters.tick_size;
+                            nudge_ticks *= 2.0;
                             let candidate = self.round_to_tick(if is_long {
                                 cur - nudge
                             } else {
