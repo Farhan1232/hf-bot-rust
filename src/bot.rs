@@ -352,26 +352,33 @@ impl TradingBot {
         };
 
         let side = if direction == "long" { "BUY" } else { "SELL" };
-        match self
+        // The market order reply carries the real average fill price. TP and SL
+        // are measured from that (not from the signal price), so the distances
+        // the client configures are the distances he actually gets. No extra
+        // API call — the value is already in the response we have.
+        let fill = match self
             .rest
             .create_market_order(&self.config.symbol, side, &quantity, false)
             .await
         {
-            Ok(_) => {}
+            Ok(v) => {
+                let avg = get_f64(&v, "avgPrice");
+                if avg > 0.0 { avg } else { price }
+            }
             Err(e) => {
                 error!("Error opening {direction} position: {e}");
                 return;
             }
-        }
+        };
 
         self.current_position = Some(direction.into());
-        self.position_entry_price = Some(price);
-        info!("Opened {direction} position at {price} (qty {quantity})");
+        self.position_entry_price = Some(fill);
+        info!("Opened {direction} position at {fill} (signal {price}, qty {quantity})");
 
-        if let Err(e) = self.place_take_profit(price).await {
+        if let Err(e) = self.place_take_profit(fill).await {
             error!("Error placing take profit: {e}");
         }
-        if let Err(e) = self.place_stop_loss(price).await {
+        if let Err(e) = self.place_stop_loss(fill).await {
             error!("Error placing stop loss: {e}");
         }
 
@@ -417,42 +424,34 @@ impl TradingBot {
     async fn place_stop_loss(&mut self, entry_price: f64) -> Result<()> {
         let quantity = self.calculate_quantity(entry_price)?;
         let max_retries = 5;
-        let mut buffer_pct = 0.0;
         // Start clean.
         self.software_stop_price = None;
         self.stop_algo_id = None;
 
+        let pct = self.config.stop_loss_percentage;
+        let is_long = match self.current_position.as_deref() {
+            Some("long") => true,
+            Some("short") => false,
+            _ => return Ok(()),
+        };
+        let side = if is_long { "SELL" } else { "BUY" };
+
+        // The stop is ALWAYS measured from the position's entry price, so the
+        // risk is exactly STOP_LOSS_PERCENTAGE regardless of how many retries
+        // happen. A retry may nudge it by a tick or two, never by another whole
+        // stop-loss distance.
+        let target = if is_long {
+            entry_price * (1.0 - pct / 100.0)
+        } else {
+            entry_price * (1.0 + pct / 100.0)
+        };
+        // Absolute ceiling on the stop distance: twice the configured one. If
+        // price has already run further than this, widening the stop would only
+        // enlarge the loss — we close instead (see the -2021 arm below).
+        let max_dist = (entry_price * pct / 100.0) * 2.0;
+
+        let mut sl_price = self.round_to_tick(target);
         for attempt in 1..=max_retries {
-            // Attempt 1 uses the price we already have (from the WebSocket); only
-            // the rare -2021 retry re-fetches a fresh price.
-            let current_price = if attempt == 1 {
-                entry_price
-            } else {
-                self.rest
-                    .symbol_price(&self.config.symbol)
-                    .await
-                    .unwrap_or(entry_price)
-            };
-            let pct = self.config.stop_loss_percentage + buffer_pct;
-
-            let (side, sl_price) = match self.current_position.as_deref() {
-                Some("long") => {
-                    let mut p = self.round_to_tick(current_price * (1.0 - pct / 100.0));
-                    if p >= current_price {
-                        p = self.round_to_tick(current_price - self.filters.tick_size);
-                    }
-                    ("SELL", p)
-                }
-                Some("short") => {
-                    let mut p = self.round_to_tick(current_price * (1.0 + pct / 100.0));
-                    if p <= current_price {
-                        p = self.round_to_tick(current_price + self.filters.tick_size);
-                    }
-                    ("BUY", p)
-                }
-                _ => return Ok(()),
-            };
-
             let trigger = self.format_price(sl_price);
             match self
                 .rest
@@ -462,18 +461,44 @@ impl TradingBot {
                 Ok(algo_id) => {
                     self.stop_algo_id = Some(algo_id);
                     info!(
-                        "Placed stop loss at {trigger} — real exchange order (algoId {algo_id}, attempt {attempt})"
+                        "Placed stop loss at {trigger} = {:.3}% from entry {entry_price} \
+                         — real exchange order (algoId {algo_id}, attempt {attempt})",
+                        (sl_price - entry_price).abs() / entry_price * 100.0
                     );
                     return Ok(());
                 }
                 Err(e) => {
                     if let Some(api) = e.downcast_ref::<ApiError>() {
-                        // -2021 (and some venues -4046) = would immediately trigger.
+                        // -2021 = the trigger is already on the wrong side of the
+                        // market, i.e. price has ALREADY run through our stop.
                         if api.code == -2021 {
-                            buffer_pct += self.config.stop_loss_percentage;
+                            let cur = self
+                                .rest
+                                .symbol_price(&self.config.symbol)
+                                .await
+                                .unwrap_or(entry_price);
+                            // Re-place just past the current price (2 ticks), but
+                            // only while that is still inside the risk ceiling.
+                            let nudge = 2.0 * self.filters.tick_size;
+                            let candidate = self.round_to_tick(if is_long {
+                                cur - nudge
+                            } else {
+                                cur + nudge
+                            });
+                            if (candidate - entry_price).abs() > max_dist {
+                                error!(
+                                    "Price ({cur}) has already run past the stop-loss level {trigger} \
+                                     by more than the allowed risk — closing the position now instead \
+                                     of widening the stop."
+                                );
+                                self.emergency_close().await;
+                                return Ok(());
+                            }
+                            sl_price = candidate;
                             warn!(
-                                "Stop loss at {trigger} would immediately trigger (price {current_price}). \
-                                 Retrying with wider buffer ({attempt}/{max_retries})."
+                                "Stop loss at {trigger} would trigger immediately (price {cur}). \
+                                 Re-placing at {} ({attempt}/{max_retries}).",
+                                self.format_price(sl_price)
                             );
                             continue;
                         }
