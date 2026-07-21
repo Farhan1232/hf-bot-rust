@@ -27,7 +27,7 @@ use crate::rest::BinanceRest;
 
 /// Bump this whenever a change ships, so the running binary can be identified
 /// from its start-up line — a stale binary is otherwise indistinguishable.
-const BUILD_VERSION: &str = "2026-07-21.10";
+const BUILD_VERSION: &str = "2026-07-21.11";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -187,8 +187,25 @@ fn resolve_entry_mode() -> Result<(Option<f64>, Option<f64>)> {
             let high = env_f64("CUSTOM_ENTRY_HIGH");
             if low.is_none() || high.is_none() {
                 return Err(anyhow!(
-                    "ENTRY_MODE=custom needs CUSTOM_ENTRY_LOW and CUSTOM_ENTRY_HIGH set in .env"
+                    "ENTRY_MODE=custom, but the two entry prices are missing from .env.\n\
+                     Edit .env and set BOTH, then start the bot again:\n\
+                     \n\
+                       CUSTOM_ENTRY_HIGH=<price ABOVE the market>   -> opens LONG\n\
+                       CUSTOM_ENTRY_LOW=<price BELOW the market>    -> opens SHORT\n\
+                     \n\
+                     Or set ENTRY_MODE=auto to go back to percentage entry."
                 ));
+            }
+            // A reversed range means both sides are already reached, so the bot
+            // would fire the instant it starts — almost never what was meant.
+            if let (Some(l), Some(h)) = (low, high) {
+                if l >= h {
+                    return Err(anyhow!(
+                        "CUSTOM_ENTRY_LOW ({l}) must be SMALLER than CUSTOM_ENTRY_HIGH ({h}).\n\
+                         LOW is the price below the market that opens a SHORT; \
+                         HIGH is the price above the market that opens a LONG."
+                    ));
+                }
             }
             println!("Entry mode: CUSTOM range from .env (LOW={low:?} -> SHORT, HIGH={high:?} -> LONG)");
             Ok((low, high))
