@@ -228,6 +228,10 @@ impl BinanceRest {
             ("side", side.into()),
             ("type", "MARKET".into()),
             ("quantity", quantity.into()),
+            // RESULT (not the default ACK) makes Binance return the real
+            // average fill price, which TP/SL are measured from. Same request,
+            // no extra round-trip.
+            ("newOrderRespType", "RESULT".into()),
         ];
         if reduce_only {
             params.push(("reduceOnly", "true".into()));

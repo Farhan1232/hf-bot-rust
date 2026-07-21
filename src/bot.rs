@@ -362,8 +362,17 @@ impl TradingBot {
             .await
         {
             Ok(v) => {
+                // avgPrice when the venue sends it; otherwise derive it from
+                // cumQuote/executedQty. Testnet omits avgPrice, live sends it.
+                // Falls back to the signal price if neither is present.
                 let avg = get_f64(&v, "avgPrice");
-                if avg > 0.0 { avg } else { price }
+                if avg > 0.0 {
+                    avg
+                } else {
+                    let quote = get_f64(&v, "cumQuote");
+                    let qty = get_f64(&v, "executedQty");
+                    if quote > 0.0 && qty > 0.0 { quote / qty } else { price }
+                }
             }
             Err(e) => {
                 error!("Error opening {direction} position: {e}");
