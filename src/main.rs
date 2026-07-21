@@ -27,7 +27,7 @@ use crate::rest::BinanceRest;
 
 /// Bump this whenever a change ships, so the running binary can be identified
 /// from its start-up line — a stale binary is otherwise indistinguishable.
-const BUILD_VERSION: &str = "2026-07-21.5";
+const BUILD_VERSION: &str = "2026-07-21.6";
 
 #[tokio::main]
 async fn main() -> Result<()> {

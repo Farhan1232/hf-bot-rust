@@ -371,12 +371,32 @@ impl TradingBot {
                 } else {
                     let quote = get_f64(&v, "cumQuote");
                     let qty = get_f64(&v, "executedQty");
-                    if quote > 0.0 && qty > 0.0 { quote / qty } else { price }
+                    if quote > 0.0 && qty > 0.0 { quote / qty } else { 0.0 }
                 }
             }
             Err(e) => {
                 error!("Error opening {direction} position: {e}");
                 return;
+            }
+        };
+
+        // Binance does not return avgPrice/cumQuote on this endpoint, so read
+        // the position's entryPrice — the exact figure the exchange (and the
+        // client) measures the stop distance against. One extra call, and it is
+        // what makes the logged percentage match Binance's own numbers.
+        let fill = if fill > 0.0 {
+            fill
+        } else {
+            match self.rest.position_information(&self.config.symbol).await {
+                Ok(positions) => positions
+                    .iter()
+                    .map(|p| get_f64(p, "entryPrice"))
+                    .find(|e| *e > 0.0)
+                    .unwrap_or(price),
+                Err(e) => {
+                    warn!("Could not read entry price ({e}) — using signal price {price}");
+                    price
+                }
             }
         };
 
