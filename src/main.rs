@@ -27,7 +27,7 @@ use crate::rest::BinanceRest;
 
 /// Bump this whenever a change ships, so the running binary can be identified
 /// from its start-up line — a stale binary is otherwise indistinguishable.
-const BUILD_VERSION: &str = "2026-07-21.6";
+const BUILD_VERSION: &str = "2026-07-21.7";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -128,6 +128,9 @@ async fn main() -> Result<()> {
     bot.log_startup();
     info!("Bot is starting... Press Ctrl+C to stop");
 
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     loop {
         tokio::select! {
             maybe_event = rx.recv() => {
@@ -144,6 +147,13 @@ async fn main() -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl+C received");
+                break;
+            }
+            // systemctl stop/restart sends SIGTERM. Without this the process is
+            // killed outright and the open position keeps its orders on the
+            // exchange with nothing watching them.
+            _ = terminate.recv() => {
+                info!("SIGTERM received (systemctl stop/restart)");
                 break;
             }
         }
