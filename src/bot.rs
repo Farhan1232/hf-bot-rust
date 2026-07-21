@@ -456,10 +456,12 @@ impl TradingBot {
         } else {
             entry_price * (1.0 + pct / 100.0)
         };
-        // Absolute ceiling on the stop distance: twice the configured one. If
-        // price has already run further than this, widening the stop would only
-        // enlarge the loss — we close instead (see the -2021 arm below).
-        let max_dist = (entry_price * pct / 100.0) * 2.0;
+        // Absolute ceiling on the stop distance: the configured distance, plus
+        // two ticks of tolerance for rounding. The stop is NEVER placed wider
+        // than STOP_LOSS_PERCENTAGE. If price has already run past that level
+        // the loss has already been taken, and a wider stop would only enlarge
+        // it — so the bot closes at market instead (see the -2021 arm below).
+        let max_dist = (entry_price * pct / 100.0) + 2.0 * self.filters.tick_size;
 
         let mut sl_price = self.round_to_tick(target);
         // A stop closer than one tick would round back onto the entry price and
@@ -517,8 +519,8 @@ impl TradingBot {
                             if (candidate - entry_price).abs() > max_dist {
                                 error!(
                                     "Price ({cur}) has already run past the stop-loss level {trigger} \
-                                     by more than the allowed risk — closing the position now instead \
-                                     of widening the stop."
+                                     ({pct}% from entry {entry_price}) — closing at market now. The \
+                                     stop is never widened beyond STOP_LOSS_PERCENTAGE."
                                 );
                                 self.emergency_close().await;
                                 return Ok(());

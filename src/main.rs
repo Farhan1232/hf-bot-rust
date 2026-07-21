@@ -25,6 +25,10 @@ use crate::config::TradingConfig;
 use crate::events::Event;
 use crate::rest::BinanceRest;
 
+/// Bump this whenever a change ships, so the running binary can be identified
+/// from its start-up line — a stale binary is otherwise indistinguishable.
+const BUILD_VERSION: &str = "2026-07-21.5";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // INFO logging by default; override with RUST_LOG (e.g. RUST_LOG=debug).
@@ -35,6 +39,11 @@ async fn main() -> Result<()> {
 
     // --- 1. decide entry mode: from .env (works for the 24/7 service), or an
     //         interactive prompt when run by hand in a real terminal ---
+    // Build stamp. If this line is missing or shows an older version, the
+    // binary being run is stale — the source was updated but not rebuilt with
+    // `cargo build --release`.
+    println!("\nBot version: {} (SL-accuracy build)", BUILD_VERSION);
+
     let _ = dotenvy::dotenv(); // load .env so ENTRY_MODE etc. are visible here
     let (low, high) = resolve_entry_mode()?;
 
