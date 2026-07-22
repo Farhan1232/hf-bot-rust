@@ -400,17 +400,7 @@ impl TradingBot {
         let fill = if fill > 0.0 {
             fill
         } else {
-            match self.rest.position_information(&self.config.symbol).await {
-                Ok(positions) => positions
-                    .iter()
-                    .map(|p| get_f64(p, "entryPrice"))
-                    .find(|e| *e > 0.0)
-                    .unwrap_or(price),
-                Err(e) => {
-                    warn!("Could not read entry price ({e}) — using signal price {price}");
-                    price
-                }
-            }
+            self.read_entry_price(direction, price).await
         };
 
         self.current_position = Some(direction.into());
@@ -432,6 +422,49 @@ impl TradingBot {
 
         // Stats update is off the timed critical path (position is already safe).
         self.update_balance_and_stats().await;
+    }
+
+    /// Read the entry price of the position we just opened, straight from the
+    /// exchange — this is the figure Binance shows the user, and the one the
+    /// stop distance must be measured from.
+    ///
+    /// The position must match the side we just opened. Right after a flip the
+    /// exchange can still be reporting the OLD position for a few milliseconds;
+    /// accepting that would anchor the stop to the previous trade's entry and
+    /// put it hundreds of ticks away. Poll briefly for the correct side, and
+    /// only fall back to the signal price if it never appears.
+    async fn read_entry_price(&self, direction: &str, signal_price: f64) -> f64 {
+        let want_long = direction == "long";
+        for attempt in 1..=10 {
+            match self.rest.position_information(&self.config.symbol).await {
+                Ok(positions) => {
+                    for p in &positions {
+                        let amt = get_f64(p, "positionAmt");
+                        let entry = get_f64(p, "entryPrice");
+                        if amt != 0.0 && entry > 0.0 && (amt > 0.0) == want_long {
+                            return entry;
+                        }
+                    }
+                }
+                Err(e) => warn!("Could not read entry price ({e}), attempt {attempt}/10"),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Still nothing. Fall back to the LAST TRADED price, never to the
+        // signal price: the signal comes from the mark-price stream, and on
+        // thin symbols mark sits ~0.5-0.8% away from last (BANK, AKE), which
+        // would put the stop that far out. The order filled at last price, so
+        // last price is the closest honest estimate of the entry.
+        let last = self
+            .rest
+            .symbol_price(&self.config.symbol)
+            .await
+            .unwrap_or(signal_price);
+        warn!(
+            "Exchange did not report the new {direction} position in time — \
+             measuring TP/SL from the last traded price {last} (signal was {signal_price})."
+        );
+        last
     }
 
     async fn place_take_profit(&self, entry_price: f64) -> Result<()> {
@@ -456,13 +489,16 @@ impl TradingBot {
             .rest
             .create_limit_order(&self.config.symbol, side, &tp_price, &quantity, true)
             .await;
-        if let Err(e) = &placed {
-            if matches!(e.downcast_ref::<ApiError>(), Some(a) if a.code == -2022) {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                placed = self
-                    .rest
-                    .create_limit_order(&self.config.symbol, side, &tp_price, &quantity, true)
-                    .await;
+        for backoff_ms in [200_u64, 400, 800] {
+            match &placed {
+                Err(e) if matches!(e.downcast_ref::<ApiError>(), Some(a) if a.code == -2022) => {
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    placed = self
+                        .rest
+                        .create_limit_order(&self.config.symbol, side, &tp_price, &quantity, true)
+                        .await;
+                }
+                _ => break,
             }
         }
         placed?;
@@ -549,26 +585,22 @@ impl TradingBot {
                 }
                 Err(e) => {
                     if let Some(api) = e.downcast_ref::<ApiError>() {
-                        // -2021 = the trigger is already on the wrong side of the
-                        // market, i.e. price has ALREADY run through our stop.
+                        // -2021 = Binance says this trigger would fire at
+                        // once. That has two very different causes, and they
+                        // need opposite responses.
                         if api.code == -2021 {
                             let cur = self
                                 .rest
                                 .symbol_price(&self.config.symbol)
                                 .await
                                 .unwrap_or(entry_price);
-                            // Re-place past the current price, doubling the gap
-                            // each attempt (2, 4, 8, 16 ticks). A fixed nudge
-                            // just gets rejected again at the same price and
-                            // burns every retry for nothing.
-                            let nudge = nudge_ticks * self.filters.tick_size;
-                            nudge_ticks *= 2.0;
-                            let candidate = self.round_to_tick(if is_long {
-                                cur - nudge
-                            } else {
-                                cur + nudge
-                            });
-                            if (candidate - entry_price).abs() > max_dist {
+
+                            // (a) Price really has run through the stop level —
+                            // the loss is already taken. Widening would only
+                            // enlarge it, so close now.
+                            let already_past =
+                                if is_long { cur <= target } else { cur >= target };
+                            if already_past {
                                 error!(
                                     "Price ({cur}) has already run past the stop-loss level {trigger} \
                                      ({pct}% from entry {entry_price}) — closing at market now. The \
@@ -577,9 +609,39 @@ impl TradingBot {
                                 self.emergency_close().await;
                                 return Ok(());
                             }
+
+                            // (b) The level is still on the correct side of the
+                            // last price, but Binance refuses it anyway — it
+                            // validates the trigger against the MARK price, and
+                            // on thin symbols mark sits far from last (BANK/AKE
+                            // ~0.5-0.8%). Nudge outward, doubling each attempt,
+                            // but NEVER inside the configured distance: pulling
+                            // the stop closer would stop the user out early on a
+                            // distance they did not ask for.
+                            let nudge = nudge_ticks * self.filters.tick_size;
+                            nudge_ticks *= 2.0;
+                            let candidate = self.round_to_tick(if is_long {
+                                (cur - nudge).min(target)
+                            } else {
+                                (cur + nudge).max(target)
+                            });
+                            if (candidate - entry_price).abs() > max_dist {
+                                // Cannot satisfy the exchange without exceeding
+                                // the risk the user configured. Keep the exact
+                                // configured level and enforce it from the bot.
+                                self.software_stop_price = Some(self.round_to_tick(target));
+                                warn!(
+                                    "Binance will not accept a stop at {pct}% from entry {entry_price} \
+                                     (it validates against mark price, which is far from last on this \
+                                     symbol). Holding the exact {pct}% level {} as a bot-side stop \
+                                     instead of widening it.",
+                                    self.format_price(target)
+                                );
+                                return Ok(());
+                            }
                             sl_price = candidate;
                             warn!(
-                                "Stop loss at {trigger} would trigger immediately (price {cur}). \
+                                "Stop loss at {trigger} rejected by Binance (last price {cur}). \
                                  Re-placing at {} ({attempt}/{max_retries}).",
                                 self.format_price(sl_price)
                             );
