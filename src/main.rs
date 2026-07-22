@@ -27,7 +27,7 @@ use crate::rest::BinanceRest;
 
 /// Bump this whenever a change ships, so the running binary can be identified
 /// from its start-up line — a stale binary is otherwise indistinguishable.
-const BUILD_VERSION: &str = "2026-07-22.4";
+const BUILD_VERSION: &str = "2026-07-22.5";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,6 +43,12 @@ async fn main() -> Result<()> {
     // binary being run is stale — the source was updated but not rebuilt with
     // `cargo build --release`.
     println!("\nBot version: {} (SL-accuracy build)", BUILD_VERSION);
+
+    // Only ONE bot may trade an account at a time. Two instances fight each
+    // other: one opens a position the other refuses to touch, one cancels the
+    // orders the other just placed, and Ctrl+C on the foreground one leaves the
+    // service still trading. Refuse to start rather than let that happen.
+    let _lock = SingleInstance::acquire()?;
 
     let _ = dotenvy::dotenv(); // load .env so ENTRY_MODE etc. are visible here
     let (low, high) = resolve_entry_mode()?;
@@ -167,6 +173,45 @@ async fn main() -> Result<()> {
 
     bot.shutdown().await;
     Ok(())
+}
+
+/// A PID lock file next to the binary, so a second bot cannot trade the same
+/// account. Removed automatically when the process exits normally.
+struct SingleInstance {
+    path: std::path::PathBuf,
+}
+
+impl SingleInstance {
+    fn acquire() -> Result<Self> {
+        let path = std::path::PathBuf::from(".bot-running.pid");
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            if let Ok(pid) = existing.trim().parse::<u32>() {
+                // On Linux a live process always has /proc/<pid>.
+                if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    return Err(anyhow!(
+                        "Another copy of the bot is ALREADY RUNNING (process {pid}).\n\
+                         \n\
+                         Two bots on one account fight each other — one opens a position the\n\
+                         other will not touch, and each cancels the other's orders.\n\
+                         \n\
+                         If it is the 24/7 service, watch it instead of starting a second copy:\n\
+                           sudo journalctl -u hf-trading-bot -f\n\
+                         \n\
+                         To run this one in the foreground, stop the service first:\n\
+                           sudo systemctl stop hf-trading-bot"
+                    ));
+                }
+            }
+        }
+        std::fs::write(&path, std::process::id().to_string())?;
+        Ok(SingleInstance { path })
+    }
+}
+
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Set leverage and CROSSED margin type before trading.

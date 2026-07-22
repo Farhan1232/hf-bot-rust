@@ -149,7 +149,10 @@ impl BinanceRest {
             Ok(_) => Ok(()),
             Err(e) => {
                 if let Some(api) = e.downcast_ref::<ApiError>() {
-                    if api.code == -4046 {
+                    // -4046 already CROSSED; -4067 cannot change while orders
+                    // exist — in both cases the existing setting stands and
+                    // trading is unaffected.
+                    if api.code == -4046 || api.code == -4067 {
                         return Ok(());
                     }
                 }
