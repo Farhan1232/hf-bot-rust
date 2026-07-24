@@ -177,6 +177,58 @@ tmux attach -t bot       # come back to it later
 
 ---
 
+## Checking that the stop loss is exactly what you set
+
+Every time the bot opens a position it now prints the whole stop-loss
+calculation, then reads the order back from Binance and prints what the
+**exchange** is actually holding. You don't have to take the bot's word for it.
+
+You'll see three lines like this (here `STOP_LOSS_PERCENTAGE=0.1`):
+
+```
+Opened long position at 0.15989 [order avgPrice] (signal price 0.15992, ordered 62, filled 62)
+SL calc | side=LONG | entry=0.15989 (from order avgPrice) | requested=0.1% | raw=0.15973011 | tick=0.00001 | rounded=0.15973 | actual=0.1001% | qty=62 | leverage=1x (not used in this maths)
+VERIFIED on Binance: stop 0.15973 is 0.1001% from entry 0.15989 (configured 0.1%, tolerance 0.0063% = one tick)
+```
+
+What to look at:
+
+| Field | What it means |
+|---|---|
+| `entry=` and `(from ...)` | The price your position really filled at, and where that number came from. `order avgPrice` is the best source. |
+| `requested=` | The `STOP_LOSS_PERCENTAGE` from your `.env`. |
+| `actual=` | What the stop actually works out to. This must match `requested`. |
+| `VERIFIED on Binance` | The bot re-read the order from the exchange. This is the number you see in the Binance app. |
+| `Stop quantity verified` | The stop covers your **whole** position, so nothing is left open if it fires. |
+
+If anything is ever wrong you will see `STOP MISMATCH on Binance` or
+`SL SANITY CHECK FAILED` in **red**. Send me that line and I can fix it from
+that alone — it contains every number that went into the decision.
+
+**Why it was wrong before:** the stop was being measured from Binance's *mark
+price* rather than the price your order actually filled at. Mark price is a
+reference number Binance calculates for funding and liquidation; on a thin coin
+it drifts away from the price trades actually happen at. On `SOLUSDT` that gap
+is essentially zero, which is why your SOL stops looked right. On `BANKUSDT` it
+is routinely 0.04% and goes far higher when the price moves — so a 0.1% stop
+was already off by more than half its own size before the percentage was even
+applied, and it was off by a *different* amount on every trade. The bot now
+follows the real traded price, and measures the stop from the actual fill.
+
+You can see that gap for yourself on any coin:
+
+```bash
+cargo run --release --example stream_check -- BANKUSDT
+```
+
+**One thing to know:** a stop can only ever be placed on the coin's price grid
+(its "tick size"). On `BANKUSDT` one tick is `0.00001`, which at a price of
+0.16 is about 0.006% — so any stop you set is accurate to within that. If you
+set a percentage *smaller* than one tick, the bot places the closest legal stop
+and tells you so in the log rather than silently doing something else.
+
+---
+
 ## Troubleshooting
 
 | Message / problem | What to do |
@@ -186,6 +238,10 @@ tmux attach -t bot       # come back to it later
 | API error about permissions / `-2015` | Your API key needs **Futures** enabled; check it on Binance. |
 | Nothing trades | It's waiting for the price to move enough to trigger. Lower the watch/confirm % to test, or use the custom range (option 1). |
 | Want more detail in the logs | Run with `RUST_LOG=debug ./run.sh` |
+| `STOP MISMATCH on Binance` / `SL SANITY CHECK FAILED` / `STOP QUANTITY MISMATCH` | Send me that line **and the `Raw response…` line under it** — together they contain everything needed to fix it. |
+| `account is in HEDGE mode` | Binance app → Futures → Preferences → Position Mode → **One-way**, then restart the bot. |
+| `Holding the ... level as a bot-side stop` | Binance refused the stop order, so the bot is enforcing it itself at the same price. Still protected, but only while the bot is running — don't stop it. |
+| Stop is a fraction of a % off | That's the coin's tick size (its price grid); the log line shows the tolerance. It can't be finer than one tick. |
 
 ---
 

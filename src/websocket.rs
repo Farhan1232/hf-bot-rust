@@ -66,6 +66,57 @@ pub async fn run_price_stream(ws_base: String, symbol: String, tx: UnboundedSend
     }
 }
 
+/// Last-traded-price stream: `<symbol>@aggTrade`. Each message carries the
+/// price of an actual trade in field `p`.
+///
+/// This runs ALONGSIDE the mark-price stream on purpose. Mark price is an
+/// index-derived number Binance publishes for funding and liquidation; on a
+/// thin symbol it can sit 0.5-0.8% away from where trades are printing. Entry
+/// triggers and the bot-side stop must follow the price the orders actually
+/// fill at, or a 0.1% stop gets measured against a number that is already
+/// 0.5% out — which is exactly how a 0.1% stop turned into 0.62%.
+pub async fn run_last_price_stream(ws_base: String, symbol: String, tx: UnboundedSender<Event>) {
+    let stream = format!("{}@aggTrade", symbol.to_lowercase());
+    let url = format!("{ws_base}/market/ws/{stream}");
+
+    loop {
+        match connect_async(&url).await {
+            Ok((mut ws, _)) => {
+                info!("Last-price (aggTrade) WebSocket connected for {symbol}");
+                while let Some(msg) = ws.next().await {
+                    match msg {
+                        Ok(Message::Text(txt)) => {
+                            if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                                if let Some(p) = v
+                                    .get("p")
+                                    .and_then(|x| x.as_str())
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                {
+                                    if tx.send(Event::LastPrice(p)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Message::Close(_)) => break,
+                        Err(e) => {
+                            error!("Last-price WebSocket error: {e}");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => error!("Last-price WebSocket connect error: {e}"),
+        }
+        if tx.is_closed() {
+            return;
+        }
+        warn!("Last-price WebSocket closed — reconnecting in 5s");
+        sleep(Duration::from_secs(5)).await;
+    }
+}
+
 /// User-data stream. Creates a fresh listenKey on every (re)connect and keeps
 /// it alive with a PUT every 30 minutes while connected. Forwards FILLED
 /// `ORDER_TRADE_UPDATE` events to the bot loop.

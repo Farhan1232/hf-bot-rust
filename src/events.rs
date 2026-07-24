@@ -11,8 +11,14 @@ use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// New mark price from the price WebSocket.
+    /// New MARK price from the mark-price WebSocket. Used only as a fallback:
+    /// on thin symbols (BANK, AKE) the mark can sit half a percent away from
+    /// the price trades actually happen at, so it must never drive a stop.
     Price(f64),
+    /// New LAST TRADED price from the aggTrade WebSocket. This is the price
+    /// shown in the Binance UI, the price the entry fills at, and therefore the
+    /// price every entry trigger and the software stop are measured against.
+    LastPrice(f64),
     /// A FILLED order event from the user-data WebSocket.
     OrderFill(OrderUpdate),
     /// Periodic reconciliation of tracked vs. actual position + orphan cleanup.

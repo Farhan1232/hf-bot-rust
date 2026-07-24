@@ -8,6 +8,7 @@
 mod bot;
 mod config;
 mod events;
+mod pricing;
 mod rest;
 mod websocket;
 
@@ -27,7 +28,7 @@ use crate::rest::BinanceRest;
 
 /// Bump this whenever a change ships, so the running binary can be identified
 /// from its start-up line — a stale binary is otherwise indistinguishable.
-const BUILD_VERSION: &str = "2026-07-22.5";
+const BUILD_VERSION: &str = "2026-07-23.2";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -75,20 +76,42 @@ async fn main() -> Result<()> {
     setup_account(&rest, &cfg).await?;
     let filters = rest.symbol_filters(&cfg.symbol).await?;
     info!(
-        "Symbol filters: tick={}, step={}, price_prec={}, qty_prec={}",
-        filters.tick_size, filters.step_size, filters.price_precision, filters.quantity_precision
+        "Symbol filters: tick={} ({}), step={}, price_decimals={}, qty_decimals={}, min_notional={}",
+        filters.tick_size,
+        filters.tick_size_str,
+        filters.step_size,
+        filters.price_precision,
+        filters.quantity_precision,
+        filters.min_notional
     );
+    // The finest stop this symbol can express, so the client can see up front
+    // whether the percentage he configured is even representable here.
+    let finest_pct = filters.tick_size / rest.symbol_price(&cfg.symbol).await.unwrap_or(0.0).max(1e-12) * 100.0;
+    if finest_pct.is_finite() && cfg.stop_loss_percentage < finest_pct {
+        info!(
+            "Note: one tick on {} is about {:.4}% at the current price, so STOP_LOSS_PERCENTAGE={}% \
+             will be placed at the closest tick ({:.4}%).",
+            cfg.symbol, finest_pct, cfg.stop_loss_percentage, finest_pct
+        );
+    }
     let initial_balance = rest.balance_usdt().await.unwrap_or(0.0);
 
     // --- 4. channels + producers ---
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
 
-    // Price WebSocket
+    // Mark-price WebSocket (fallback reference only)
     {
         let ws_base = cfg.ws_base().to_string();
         let symbol = cfg.symbol.clone();
         let tx = tx.clone();
         tokio::spawn(async move { websocket::run_price_stream(ws_base, symbol, tx).await });
+    }
+    // Last-traded-price WebSocket — the price every trading decision uses
+    {
+        let ws_base = cfg.ws_base().to_string();
+        let symbol = cfg.symbol.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move { websocket::run_last_price_stream(ws_base, symbol, tx).await });
     }
     // User-data WebSocket (order fills)
     {
@@ -216,6 +239,23 @@ impl Drop for SingleInstance {
 
 /// Set leverage and CROSSED margin type before trading.
 async fn setup_account(rest: &BinanceRest, cfg: &TradingConfig) -> Result<()> {
+    // Every TP/SL this bot sends is `reduceOnly`, which Binance rejects
+    // outright in hedge mode. Fail here with an instruction rather than open a
+    // position and then be unable to protect it.
+    match rest.is_hedge_mode().await {
+        Ok(true) => {
+            return Err(anyhow!(
+                "This Binance account is in HEDGE mode (dual position side).\n\
+                 The bot's take-profit and stop-loss orders are reduce-only, which hedge mode\n\
+                 does not accept — a position would be opened with no stop behind it.\n\
+                 \n\
+                 Fix it in the Binance app: Futures -> Preferences -> Position Mode -> One-way,\n\
+                 then start the bot again. (You must have no open positions to switch.)"
+            ));
+        }
+        Ok(false) => info!("Position mode: One-way (required for reduce-only TP/SL)"),
+        Err(e) => error!("Could not read the account's position mode: {e}"),
+    }
     rest.change_leverage(&cfg.symbol, cfg.leverage).await?;
     info!("Leverage set to {}x", cfg.leverage);
     match rest.change_margin_type_crossed(&cfg.symbol).await {

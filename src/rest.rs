@@ -39,6 +39,10 @@ pub struct SymbolFilters {
     /// (5 for most alt-coins, 50 for BTC, 20 for ETH), so it must be read from
     /// the exchange rather than assumed.
     pub min_notional: f64,
+    /// The raw `tickSize` string as Binance sent it, e.g. `"0.0000100"`. Kept
+    /// for the start-up log so the client can see the grid his stop is snapped
+    /// to without opening the API docs.
+    pub tick_size_str: String,
 }
 
 pub struct BinanceRest {
@@ -177,18 +181,60 @@ impl BinanceRest {
             .and_then(|f| f.as_array())
             .ok_or_else(|| anyhow!("no filters for {symbol}"))?;
 
-        let tick_size = filter_field(filters, "PRICE_FILTER", "tickSize")?;
-        let step_size = filter_field(filters, "LOT_SIZE", "stepSize")?;
-        // MIN_NOTIONAL is absent on a few symbols; 5 is Binance's floor.
-        let min_notional = filter_field(filters, "MIN_NOTIONAL", "notional").unwrap_or(5.0);
+        let tick_size_str = filter_str(filters, "PRICE_FILTER", "tickSize")
+            .ok_or_else(|| anyhow!("no tickSize for {symbol}"))?;
+        let step_size_str = filter_str(filters, "LOT_SIZE", "stepSize")
+            .ok_or_else(|| anyhow!("no stepSize for {symbol}"))?;
+        let tick_size: f64 = tick_size_str.parse().unwrap_or(0.0);
+        let step_size: f64 = step_size_str.parse().unwrap_or(0.0);
+        if tick_size <= 0.0 || step_size <= 0.0 {
+            return Err(anyhow!(
+                "{symbol}: unusable filters (tickSize={tick_size_str}, stepSize={step_size_str})"
+            ));
+        }
+        // MIN_NOTIONAL is absent on a few symbols; 5 is Binance's floor. A
+        // present-but-zero value would silently disable the minimum-size check,
+        // so treat it the same as missing.
+        let min_notional = match filter_field(filters, "MIN_NOTIONAL", "notional") {
+            Ok(v) if v > 0.0 => v,
+            _ => 5.0,
+        };
+
+        // Decimals come from the tick/step STRING, never from -log10(value).
+        // log10 is only correct for clean powers of ten: a tick of 0.005 gives
+        // 2 decimals instead of 3, and a price printed with too few decimals is
+        // rounded onto a coarser grid than the symbol really uses — which moves
+        // the stop away from the configured percentage. Clamp to the exchange's
+        // own pricePrecision so we can never send more decimals than allowed.
+        let max_price_dp = usize_field(sym, "pricePrecision").unwrap_or(8);
+        let max_qty_dp = usize_field(sym, "quantityPrecision").unwrap_or(8);
+        let price_precision = crate::pricing::decimals_from_size_str(&tick_size_str)
+            .unwrap_or_else(|| crate::pricing::decimals_from_size(tick_size))
+            .min(max_price_dp);
+        let quantity_precision = crate::pricing::decimals_from_size_str(&step_size_str)
+            .unwrap_or_else(|| crate::pricing::decimals_from_size(step_size))
+            .min(max_qty_dp);
 
         Ok(SymbolFilters {
             tick_size,
             step_size,
-            price_precision: precision_from(tick_size),
-            quantity_precision: precision_from(step_size),
+            price_precision,
+            quantity_precision,
             min_notional,
+            tick_size_str,
         })
+    }
+
+    /// Is the account in HEDGE (dual-position) mode? Every order this bot sends
+    /// uses `reduceOnly`, which Binance rejects outright in hedge mode, so the
+    /// bot must say so at start-up rather than fail on the first stop-loss.
+    pub async fn is_hedge_mode(&self) -> Result<bool> {
+        let v = self
+            .signed(reqwest::Method::GET, "/fapi/v1/positionSide/dual", vec![])
+            .await?;
+        Ok(v.get("dualSidePosition")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false))
     }
 
     pub async fn balance_usdt(&self) -> Result<f64> {
@@ -249,6 +295,26 @@ impl BinanceRest {
         self.signed(reqwest::Method::POST, "/fapi/v1/order", params).await
     }
 
+    /// Read one order back by id (`GET /fapi/v1/order`).
+    ///
+    /// This is the ONLY source of an entry price that is guaranteed to belong
+    /// to the trade we just made: `avgPrice` here is the average of this
+    /// order's own fills. `positionRisk.entryPrice`, by contrast, is the
+    /// average of the WHOLE position — if any size was left over from a
+    /// previous trade it is blended in, and the stop measured from it lands at
+    /// a percentage nobody configured.
+    pub async fn get_order(&self, symbol: &str, order_id: i64) -> Result<Value> {
+        self.signed(
+            reqwest::Method::GET,
+            "/fapi/v1/order",
+            vec![
+                ("symbol", symbol.into()),
+                ("orderId", order_id.to_string()),
+            ],
+        )
+        .await
+    }
+
     pub async fn create_limit_order(
         &self,
         symbol: &str,
@@ -274,7 +340,12 @@ impl BinanceRest {
     /// Place a stop-loss as a CONDITIONAL algo order via the new endpoint
     /// (`POST /fapi/v1/algoOrder`). Since Binance's 2025-12-09 migration, stop
     /// orders MUST go here — the old `/fapi/v1/order` rejects them with -4120.
-    /// Returns the `algoId` so it can be cancelled later.
+    /// Returns the `algoId` (so it can be cancelled later) AND the raw response
+    /// body. The raw body is kept rather than discarded because it is the only
+    /// record of what the exchange actually said: a past bug here was only
+    /// found by dumping the full payload and discovering Binance returned
+    /// neither of the fields the code was reading. It is logged only when
+    /// something looks wrong — see `verify_stop_on_exchange`.
     pub async fn create_algo_stop_market(
         &self,
         symbol: &str,
@@ -282,7 +353,7 @@ impl BinanceRest {
         trigger_price: &str,
         quantity: &str,
         reduce_only: bool,
-    ) -> Result<i64> {
+    ) -> Result<(i64, Value)> {
         let mut params = vec![
             ("algoType", "CONDITIONAL".into()),
             ("symbol", symbol.into()),
@@ -303,7 +374,9 @@ impl BinanceRest {
         let v = self
             .signed(reqwest::Method::POST, "/fapi/v1/algoOrder", params)
             .await?;
-        get_i64(&v, "algoId").ok_or_else(|| anyhow!("no algoId in algoOrder response: {v}"))
+        let algo_id = get_i64(&v, "algoId")
+            .ok_or_else(|| anyhow!("no algoId in algoOrder response: {v}"))?;
+        Ok((algo_id, v))
     }
 
     /// List open CONDITIONAL algo orders (the resting stop-losses) for a symbol.
@@ -433,15 +506,20 @@ fn filter_field(filters: &[Value], filter_type: &str, field: &str) -> Result<f64
     Ok(get_f64(f, field))
 }
 
-/// Decimal places implied by a tick/step size, e.g. 0.001 -> 3.
-fn precision_from(size: f64) -> usize {
-    if size <= 0.0 {
-        return 0;
-    }
-    let p = (-size.log10()).round();
-    if p < 0.0 {
-        0
-    } else {
-        p as usize
-    }
+/// The RAW string of a filter field. Binance sends `tickSize` as a decimal
+/// string (`"0.0000100"`); its decimal count is the symbol's true price
+/// precision, and parsing it to f64 first throws that information away.
+fn filter_str(filters: &[Value], filter_type: &str, field: &str) -> Option<String> {
+    filters
+        .iter()
+        .find(|f| f.get("filterType").and_then(|x| x.as_str()) == Some(filter_type))?
+        .get(field)
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+}
+
+fn usize_field(v: &Value, key: &str) -> Option<usize> {
+    get_i64(v, key).and_then(|n| usize::try_from(n).ok())
 }

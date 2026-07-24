@@ -12,6 +12,32 @@
 //!     orphan orders, but leaves a user's own TP/SL edits alone (order count
 //!     of 2 is left untouched — client requirement #8).
 //!
+//! STOP-LOSS ACCURACY — the one guarantee this file exists to keep:
+//!
+//!   The stop is placed at STOP_LOSS_PERCENTAGE of the price the position
+//!   ACTUALLY FILLED AT, in both directions, on every symbol, at every
+//!   leverage, and the placed level is read back from Binance and logged.
+//!
+//! The arithmetic (`pricing.rs`, unit-tested) was never the hard part. What
+//! made a configured 0.10% stop land at 0.62% was the number it was measured
+//! FROM. Three things could substitute a different price, and all three are
+//! closed here:
+//!
+//!   * the MARK price — an index-derived figure that sits 0.5-0.8% away from
+//!     traded prices on thin symbols like BANK, and moves independently, which
+//!     is why the error varied trade to trade and why SOL (liquid, mark ~=
+//!     last) looked fine while BANK did not. The mark stream no longer drives
+//!     any decision; a separate aggTrade stream supplies the traded price.
+//!   * a BLENDED position entry — `positionRisk.entryPrice` averages the whole
+//!     position. TP/SL are now sized from the exact filled quantity so nothing
+//!     survives a close, and the entry comes from this order's own `avgPrice`.
+//!   * a STALE stop from an earlier trade — nothing ever checked that the
+//!     resting stop belonged to the current position. The consistency check
+//!     now verifies it and replaces it if it does not.
+//!
+//! Leverage appears nowhere in the stop calculation and must not: it changes
+//! the ROI of a price move, not the price.
+//!
 //! WHAT CHANGED FOR SPEED (client requirements #2 and #3):
 //!   * every `time.sleep(...)` in the open/close/flip hot path is GONE,
 //!   * no per-order Binance time re-sync round-trip,
@@ -27,8 +53,27 @@ use tracing::{error, info, warn};
 
 use crate::config::TradingConfig;
 use crate::events::{Event, OrderUpdate};
+use crate::pricing;
 use crate::rest::{get_f64, get_i64, ApiError, BinanceRest, SymbolFilters};
 
+/// Everything that went into one stop-loss decision, kept together so the whole
+/// chain can be logged on a single line. Both reviews of the old behaviour
+/// asked for exactly this: without it there is no way to tell a bad entry price
+/// from bad arithmetic from an exchange rejection.
+struct StopLossTrace {
+    entry: f64,
+    entry_source: &'static str,
+    requested_pct: f64,
+    raw: f64,
+    rounded: f64,
+    tick: f64,
+}
+
+impl StopLossTrace {
+    fn actual_pct(&self) -> f64 {
+        pricing::distance_pct(self.entry, self.rounded)
+    }
+}
 
 pub struct TradingBot {
     config: TradingConfig,
@@ -44,6 +89,15 @@ pub struct TradingBot {
     // --- position state ---
     current_position: Option<String>, // "long" / "short"
     position_entry_price: Option<f64>,
+    /// The exact quantity this position was filled with, already formatted to
+    /// the symbol's step size. TP and SL are placed for THIS amount rather than
+    /// a freshly recomputed one: recomputing from a slightly different price
+    /// can floor to a different step, leaving a sliver of the position open
+    /// after the stop fires. The flip then adds to that sliver, Binance blends
+    /// the entry prices, and every stop after that is measured from a number
+    /// the user never chose — the "same setting, different result each trade"
+    /// symptom.
+    position_quantity: Option<String>,
     /// algoId of the exchange-side stop-loss (CONDITIONAL algo order). Stored so
     /// we can cancel it on flip/TP/shutdown. `None` if no algo stop is active.
     stop_algo_id: Option<i64>,
@@ -58,7 +112,13 @@ pub struct TradingBot {
     trades_count: u64,
     profitable_trades: u64,
 
+    /// Latest LAST TRADED price (aggTrade stream) — the price the Binance UI
+    /// shows and the price orders actually fill at. Every trading decision uses
+    /// this.
     last_price: Option<f64>,
+    /// Latest MARK price (markPrice stream). Kept for logging and as a
+    /// stand-in only while the trade stream has not printed anything yet.
+    mark_price: Option<f64>,
     last_logged_price: Option<f64>,
 
     pub stop_flag: bool,
@@ -92,6 +152,7 @@ impl TradingBot {
             use_custom_entry,
             current_position: None,
             position_entry_price: None,
+            position_quantity: None,
             stop_algo_id: None,
             software_stop_price: None,
             initial_balance,
@@ -99,6 +160,7 @@ impl TradingBot {
             trades_count: 0,
             profitable_trades: 0,
             last_price: None,
+            mark_price: None,
             last_logged_price: None,
             stop_flag: false,
         }
@@ -134,7 +196,8 @@ impl TradingBot {
     // -----------------------------------------------------------------
     pub async fn handle(&mut self, event: Event) {
         match event {
-            Event::Price(p) => self.on_price(p).await,
+            Event::Price(p) => self.on_mark_price(p).await,
+            Event::LastPrice(p) => self.on_last_price(p).await,
             Event::OrderFill(o) => self.on_order_fill(o).await,
             Event::ConsistencyTick => self.consistency_check().await,
             Event::Heartbeat => self.heartbeat(),
@@ -144,9 +207,60 @@ impl TradingBot {
     // -----------------------------------------------------------------
     // Price handling: two-stage watch/confirm or custom entry range
     // -----------------------------------------------------------------
-    async fn on_price(&mut self, price: f64) {
-        self.last_price = Some(price);
+    /// Mark price arrived. Mark is NOT a tradable price — on a thin symbol it
+    /// sits well away from where trades print — so it only drives decisions
+    /// while the trade stream has not yet printed anything (first seconds after
+    /// start-up, or a dead market).
+    async fn on_mark_price(&mut self, price: f64) {
+        self.mark_price = Some(price);
+        // Only act on the mark while the trade stream has told us nothing at
+        // all — better a slightly-off price than a bot that never trades.
+        if self.last_price.is_none() {
+            self.on_price(price, true).await;
+            return;
+        }
+        // Safety net for a quiet or broken trade stream: a software stop is
+        // only enforced on trade prints, and an illiquid symbol can go a long
+        // time without one. If the MARK suggests the level is breached, ask
+        // Binance for the real last traded price and decide on that — the mark
+        // gets a vote on when to look, never on where the stop is.
+        if let (Some(sl), Some(dir)) = (self.software_stop_price, self.current_position.clone()) {
+            let mark_breach = match dir.as_str() {
+                "long" => price <= sl,
+                "short" => price >= sl,
+                _ => false,
+            };
+            if mark_breach {
+                if let Ok(last) = self.rest.symbol_price(&self.config.symbol).await {
+                    self.last_price = Some(last);
+                    let real_breach = match dir.as_str() {
+                        "long" => last <= sl,
+                        "short" => last >= sl,
+                        _ => false,
+                    };
+                    if real_breach {
+                        warn!(
+                            "Software stop level {sl} breached (mark {price}, last traded {last}) \
+                             — no trade print had arrived to check it against."
+                        );
+                        self.fire_software_stop(last).await;
+                    }
+                }
+            }
+        }
+    }
 
+    /// Last traded price arrived — the price the client sees on Binance. This
+    /// is what every entry trigger and the bot-side stop are measured against.
+    async fn on_last_price(&mut self, price: f64) {
+        self.last_price = Some(price);
+        self.on_price(price, true).await;
+    }
+
+    /// `tradable` marks a price that orders can actually fill at (a real trade
+    /// print, or the mark price while nothing has traded yet). Only a tradable
+    /// price may open a position or fire the software stop.
+    async fn on_price(&mut self, price: f64, tradable: bool) {
         // Log notable moves (>0.5%) like the Python bot.
         match self.last_logged_price {
             None => {
@@ -178,15 +292,31 @@ impl TradingBot {
         // the venue rejected a resting STOP_MARKET), then stop — no new entries.
         if self.current_position.is_some() {
             if let Some(sl) = self.software_stop_price {
-                let breached = match self.current_position.as_deref() {
-                    Some("long") => price <= sl,
-                    Some("short") => price >= sl,
-                    _ => false,
-                };
-                if breached {
-                    self.fire_software_stop(price).await;
+                // ONLY the last traded price may fire this. It used to be
+                // evaluated against whatever price arrived, and the mark-price
+                // stream ticks far more often — on a thin symbol the mark sits
+                // 0.5-0.8% from where trades print, so a 0.1% software stop
+                // fired the instant the position opened, at a level the price
+                // had never actually traded at.
+                if tradable {
+                    let breached = match self.current_position.as_deref() {
+                        Some("long") => price <= sl,
+                        Some("short") => price >= sl,
+                        _ => false,
+                    };
+                    if breached {
+                        self.fire_software_stop(price).await;
+                    }
                 }
             }
+            return;
+        }
+
+        // Nothing below this line may open a position from a price that is not
+        // tradable. The custom entry range is a price the user read off the
+        // Binance chart, and the stop is measured from the fill — both belong
+        // to the last-traded scale, not to the mark scale.
+        if !tradable {
             return;
         }
 
@@ -355,24 +485,12 @@ impl TradingBot {
         // are measured from that (not from the signal price), so the distances
         // the client configures are the distances he actually gets. No extra
         // API call — the value is already in the response we have.
-        let fill = match self
+        let order = match self
             .rest
             .create_market_order(&self.config.symbol, side, &quantity, false)
             .await
         {
-            Ok(v) => {
-                // avgPrice when the venue sends it; otherwise derive it from
-                // cumQuote/executedQty. Testnet omits avgPrice, live sends it.
-                // Falls back to the signal price if neither is present.
-                let avg = get_f64(&v, "avgPrice");
-                if avg > 0.0 {
-                    avg
-                } else {
-                    let quote = get_f64(&v, "cumQuote");
-                    let qty = get_f64(&v, "executedQty");
-                    if quote > 0.0 && qty > 0.0 { quote / qty } else { 0.0 }
-                }
-            }
+            Ok(v) => v,
             Err(e) => {
                 // -4164: the order value is under this symbol's minimum. Say
                 // what to change rather than repeating Binance's wording —
@@ -393,24 +511,27 @@ impl TradingBot {
             }
         };
 
-        // Binance does not return avgPrice/cumQuote on this endpoint, so read
-        // the position's entryPrice — the exact figure the exchange (and the
-        // client) measures the stop distance against. One extra call, and it is
-        // what makes the logged percentage match Binance's own numbers.
-        let fill = if fill > 0.0 {
-            fill
-        } else {
-            self.read_entry_price(direction, price).await
-        };
+        // Resolve what this order ACTUALLY filled at and for how much. Both the
+        // price and the quantity have to come from the order itself — see
+        // `resolve_fill` for why anything else puts the stop in the wrong place.
+        let (fill, filled_qty, entry_source) =
+            self.resolve_fill(&order, direction, price, &quantity).await;
 
         self.current_position = Some(direction.into());
         self.position_entry_price = Some(fill);
-        info!("Opened {direction} position at {fill} (signal {price}, qty {quantity})");
+        self.position_quantity = Some(filled_qty.clone());
+        info!(
+            "Opened {direction} position at {fill} [{entry_source}] \
+             (signal price {price}, ordered {quantity}, filled {filled_qty})"
+        );
 
-        if let Err(e) = self.place_take_profit(fill).await {
+        if let Err(e) = self.place_take_profit(fill, &filled_qty).await {
             error!("Error placing take profit: {e}");
         }
-        if let Err(e) = self.place_stop_loss(fill).await {
+        if let Err(e) = self
+            .place_stop_loss(fill, &filled_qty, entry_source)
+            .await
+        {
             error!("Error placing stop loss: {e}");
         }
 
@@ -424,16 +545,86 @@ impl TradingBot {
         self.update_balance_and_stats().await;
     }
 
-    /// Read the entry price of the position we just opened, straight from the
-    /// exchange — this is the figure Binance shows the user, and the one the
-    /// stop distance must be measured from.
+    /// Work out the price and quantity this market order ACTUALLY filled at,
+    /// in strict order of trustworthiness. Returns `(price, quantity, source)`.
     ///
-    /// The position must match the side we just opened. Right after a flip the
-    /// exchange can still be reporting the OLD position for a few milliseconds;
-    /// accepting that would anchor the stop to the previous trade's entry and
-    /// put it hundreds of ticks away. Poll briefly for the correct side, and
-    /// only fall back to the signal price if it never appears.
-    async fn read_entry_price(&self, direction: &str, signal_price: f64) -> f64 {
+    /// This function is the fix for the reported bug. The stop-loss percentage
+    /// is only ever as accurate as the number it is measured from, and the
+    /// candidates are not equally good:
+    ///
+    ///  1. `avgPrice` on the order reply — this order's own average fill.
+    ///     Exact, free, and what Binance itself calls the entry of this trade.
+    ///  2. `cumQuote / executedQty` on the reply — the same figure computed by
+    ///     hand, for venues (testnet) that omit `avgPrice`.
+    ///  3. `GET /fapi/v1/order` for this orderId — same as (1), for the case
+    ///     where the reply came back before the fill was booked. Still THIS
+    ///     order only.
+    ///  4. `positionRisk.entryPrice` — the average of the WHOLE position. Only
+    ///     correct when the position is exactly this one order; if any size
+    ///     survived from an earlier trade it is blended in. Warned about.
+    ///  5. Last traded price — an estimate. Loudly warned about.
+    ///
+    /// What is deliberately NOT in this list: the mark price and the signal
+    /// price. On a thin symbol the mark sits 0.5-0.8% from where trades print,
+    /// so a stop measured from it is off by that much before the percentage is
+    /// even applied — a 0.10% stop lands at 0.62%, which is exactly what was
+    /// reported, and it varies trade to trade because the mark/last gap varies.
+    async fn resolve_fill(
+        &self,
+        order: &Value,
+        direction: &str,
+        signal_price: f64,
+        ordered_qty: &str,
+    ) -> (f64, String, &'static str) {
+        let qty_of = |v: &Value| -> Option<String> {
+            let q = get_f64(v, "executedQty");
+            if q > 0.0 {
+                Some(self.format_quantity(q))
+            } else {
+                None
+            }
+        };
+
+        // (1) and (2): straight off the reply we already have.
+        let avg = get_f64(order, "avgPrice");
+        if avg > 0.0 {
+            if let Some(q) = qty_of(order) {
+                return (avg, q, "order avgPrice");
+            }
+        }
+        let quote = get_f64(order, "cumQuote");
+        let exec = get_f64(order, "executedQty");
+        if quote > 0.0 && exec > 0.0 {
+            return (quote / exec, self.format_quantity(exec), "order cumQuote/executedQty");
+        }
+
+        // (3) Re-read THIS order until the fill is booked.
+        if let Some(order_id) = get_i64(order, "orderId") {
+            for attempt in 1..=10 {
+                match self.rest.get_order(&self.config.symbol, order_id).await {
+                    Ok(v) => {
+                        let avg = get_f64(&v, "avgPrice");
+                        let exec = get_f64(&v, "executedQty");
+                        if avg > 0.0 && exec > 0.0 {
+                            return (avg, self.format_quantity(exec), "order lookup avgPrice");
+                        }
+                        let quote = get_f64(&v, "cumQuote");
+                        if quote > 0.0 && exec > 0.0 {
+                            return (
+                                quote / exec,
+                                self.format_quantity(exec),
+                                "order lookup cumQuote/executedQty",
+                            );
+                        }
+                    }
+                    Err(e) => warn!("Could not read back order {order_id} ({e}), attempt {attempt}/10"),
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        // (4) The position's blended entry. Correct only if this order is the
+        // whole position — verify that before trusting it.
         let want_long = direction == "long";
         for attempt in 1..=10 {
             match self.rest.position_information(&self.config.symbol).await {
@@ -442,7 +633,19 @@ impl TradingBot {
                         let amt = get_f64(p, "positionAmt");
                         let entry = get_f64(p, "entryPrice");
                         if amt != 0.0 && entry > 0.0 && (amt > 0.0) == want_long {
-                            return entry;
+                            let held = amt.abs();
+                            let ordered = ordered_qty.parse::<f64>().unwrap_or(0.0);
+                            if ordered > 0.0 && (held - ordered).abs() > self.filters.step_size / 2.0
+                            {
+                                warn!(
+                                    "Position holds {held} but this order was for {ordered} — \
+                                     entryPrice {entry} is BLENDED with an earlier trade, so the \
+                                     stop distance will be measured from a price that is not this \
+                                     entry. Check for a leftover position on {}.",
+                                    self.config.symbol
+                                );
+                            }
+                            return (entry, self.format_quantity(held), "position entryPrice (blended)");
                         }
                     }
                 }
@@ -450,36 +653,39 @@ impl TradingBot {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // Still nothing. Fall back to the LAST TRADED price, never to the
-        // signal price: the signal comes from the mark-price stream, and on
-        // thin symbols mark sits ~0.5-0.8% away from last (BANK, AKE), which
-        // would put the stop that far out. The order filled at last price, so
-        // last price is the closest honest estimate of the entry.
+
+        // (5) Nothing worked. Use the LAST TRADED price, never the signal
+        // price: the signal may have come from the mark stream, and on thin
+        // symbols mark sits ~0.5-0.8% away from last (BANK, AKE), which would
+        // put the stop that far out on its own.
         let last = self
             .rest
             .symbol_price(&self.config.symbol)
             .await
             .unwrap_or(signal_price);
-        warn!(
-            "Exchange did not report the new {direction} position in time — \
-             measuring TP/SL from the last traded price {last} (signal was {signal_price})."
+        error!(
+            "Could not confirm the fill price of the new {direction} position from the exchange. \
+             Falling back to the last traded price {last} (signal was {signal_price}). The stop \
+             distance may be off by the difference between these two — verify it on Binance."
         );
-        last
+        // The exact payload Binance sent for the entry order. Every source
+        // above read a named field out of this and found nothing usable, so
+        // this is the only way to see WHY. A previous bug here was exactly
+        // that: the response carried neither `avgPrice` nor `cumQuote`, and it
+        // took dumping the whole body to discover it.
+        error!("Raw response from the entry market order was: {order}");
+        (last, ordered_qty.to_string(), "last traded price (ESTIMATE)")
     }
 
-    async fn place_take_profit(&self, entry_price: f64) -> Result<()> {
-        let quantity = self.calculate_quantity(entry_price)?;
-        let (side, raw_tp) = match self.current_position.as_deref() {
-            Some("long") => (
-                "SELL",
-                entry_price * (1.0 + self.config.take_profit_percentage / 100.0),
-            ),
-            Some("short") => (
-                "BUY",
-                entry_price * (1.0 - self.config.take_profit_percentage / 100.0),
-            ),
+    async fn place_take_profit(&self, entry_price: f64, quantity: &str) -> Result<()> {
+        let is_long = match self.current_position.as_deref() {
+            Some("long") => true,
+            Some("short") => false,
             _ => return Ok(()),
         };
+        let side = if is_long { "SELL" } else { "BUY" };
+        let raw_tp =
+            pricing::take_profit_target(entry_price, self.config.take_profit_percentage, is_long);
         let tp_price = self.format_price(self.round_to_tick(raw_tp));
         // Straight after a flip the new position can take a moment to register,
         // and a reduce-only order against a position Binance cannot see yet is
@@ -487,7 +693,7 @@ impl TradingBot {
         // no take profit at all.
         let mut placed = self
             .rest
-            .create_limit_order(&self.config.symbol, side, &tp_price, &quantity, true)
+            .create_limit_order(&self.config.symbol, side, &tp_price, quantity, true)
             .await;
         for backoff_ms in [200_u64, 400, 800] {
             match &placed {
@@ -495,7 +701,7 @@ impl TradingBot {
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     placed = self
                         .rest
-                        .create_limit_order(&self.config.symbol, side, &tp_price, &quantity, true)
+                        .create_limit_order(&self.config.symbol, side, &tp_price, quantity, true)
                         .await;
                 }
                 _ => break,
@@ -503,8 +709,12 @@ impl TradingBot {
         }
         placed?;
         info!(
-            "Take profit ({:?}) placed at {tp_price} (entry {entry_price})",
-            self.current_position
+            "Take profit ({:?}) placed at {tp_price} for {quantity} = {:.4}% from entry {entry_price} \
+             (requested {}%, raw {raw_tp}, tick {})",
+            self.current_position,
+            pricing::distance_pct(entry_price, tp_price.parse::<f64>().unwrap_or(raw_tp)),
+            self.config.take_profit_percentage,
+            self.filters.tick_size
         );
         Ok(())
     }
@@ -516,8 +726,12 @@ impl TradingBot {
     /// STOP_LOSS_PERCENTAGE; a -2021 ("would immediately trigger") retry may
     /// shift it by a tick or two but never by another whole percentage, and
     /// never past 2x the configured distance.
-    async fn place_stop_loss(&mut self, entry_price: f64) -> Result<()> {
-        let quantity = self.calculate_quantity(entry_price)?;
+    async fn place_stop_loss(
+        &mut self,
+        entry_price: f64,
+        quantity: &str,
+        entry_source: &'static str,
+    ) -> Result<()> {
         let max_retries = 5;
         // Start clean.
         self.software_stop_price = None;
@@ -531,15 +745,18 @@ impl TradingBot {
         };
         let side = if is_long { "SELL" } else { "BUY" };
 
+        if !(entry_price.is_finite() && entry_price > 0.0) {
+            error!("Refusing to place a stop loss from a bad entry price ({entry_price}) — closing at market.");
+            self.emergency_close().await;
+            return Ok(());
+        }
+
         // The stop is ALWAYS measured from the position's entry price, so the
         // risk is exactly STOP_LOSS_PERCENTAGE regardless of how many retries
         // happen. A retry may nudge it by a tick or two, never by another whole
-        // stop-loss distance.
-        let target = if is_long {
-            entry_price * (1.0 - pct / 100.0)
-        } else {
-            entry_price * (1.0 + pct / 100.0)
-        };
+        // stop-loss distance. No leverage term appears here and none may be
+        // added: leverage changes the ROI of a move, not its price.
+        let target = pricing::stop_loss_target(entry_price, pct, is_long);
         // Absolute ceiling on the stop distance: the configured distance, plus
         // two ticks of tolerance for rounding. The stop is NEVER placed wider
         // than STOP_LOSS_PERCENTAGE. If price has already run past that level
@@ -548,39 +765,82 @@ impl TradingBot {
         let max_dist = (entry_price * pct / 100.0) + 2.0 * self.filters.tick_size;
 
         let mut nudge_ticks = 2.0_f64;
-        let mut sl_price = self.round_to_tick(target);
+        let (mut sl_price, hit_tick_floor) =
+            pricing::stop_loss_price(entry_price, pct, is_long, self.filters.tick_size);
         // A stop closer than one tick would round back onto the entry price and
-        // be rejected. Push it to the nearest legal tick and say so, because it
-        // means the configured percentage is finer than this symbol can express.
-        if (sl_price - entry_price).abs() < self.filters.tick_size {
-            sl_price = self.round_to_tick(if is_long {
-                entry_price - self.filters.tick_size
-            } else {
-                entry_price + self.filters.tick_size
-            });
+        // be rejected. `stop_loss_price` pushes it to the nearest legal tick;
+        // say so, because it means the configured percentage is finer than this
+        // symbol can express.
+        if hit_tick_floor {
             warn!(
                 "STOP_LOSS_PERCENTAGE={pct}% is smaller than one tick ({}) on {} — \
-                 using the closest possible stop {} ({:.3}%).",
+                 using the closest possible stop {} ({:.4}%).",
                 self.filters.tick_size,
                 self.config.symbol,
                 self.format_price(sl_price),
-                (sl_price - entry_price).abs() / entry_price * 100.0
+                pricing::distance_pct(entry_price, sl_price)
             );
         }
+
+        // The full audit trail for this stop, on one line. Every question the
+        // client (or a reviewer) can ask about a stop is answered here without
+        // needing to reproduce the trade.
+        let trace = StopLossTrace {
+            entry: entry_price,
+            entry_source,
+            requested_pct: pct,
+            raw: target,
+            rounded: sl_price,
+            tick: self.filters.tick_size,
+        };
+        info!(
+            "SL calc | side={} | entry={} (from {}) | requested={}% | raw={} | tick={} | \
+             rounded={} | actual={:.4}% | qty={quantity} | leverage={}x (not used in this maths)",
+            if is_long { "LONG" } else { "SHORT" },
+            trace.entry,
+            trace.entry_source,
+            trace.requested_pct,
+            trace.raw,
+            trace.tick,
+            self.format_price(trace.rounded),
+            trace.actual_pct(),
+            self.config.leverage
+        );
+        // The invariant the client is actually paying for. If the placed level
+        // is not within a tick of what he configured, that is a bug, and it
+        // must be shouted about in the log rather than discovered on Binance.
+        let tolerance_pct = self.filters.tick_size / entry_price * 100.0 + 1e-9;
+        if !hit_tick_floor && (trace.actual_pct() - pct).abs() > tolerance_pct {
+            error!(
+                "SL SANITY CHECK FAILED: configured {pct}% but computed {:.4}% \
+                 (entry {entry_price} from {entry_source}, level {}). This should be impossible — \
+                 please report this log line.",
+                trace.actual_pct(),
+                self.format_price(sl_price)
+            );
+        }
+
+        let mut last_attempted = f64::NAN;
         for attempt in 1..=max_retries {
             let trigger = self.format_price(sl_price);
             match self
                 .rest
-                .create_algo_stop_market(&self.config.symbol, side, &trigger, &quantity, true)
+                .create_algo_stop_market(&self.config.symbol, side, &trigger, quantity, true)
                 .await
             {
-                Ok(algo_id) => {
+                Ok((algo_id, raw)) => {
                     self.stop_algo_id = Some(algo_id);
                     info!(
-                        "Placed stop loss at {trigger} = {:.3}% from entry {entry_price} \
+                        "Placed stop loss at {trigger} = {:.4}% from entry {entry_price} \
                          — real exchange order (algoId {algo_id}, attempt {attempt})",
-                        (sl_price - entry_price).abs() / entry_price * 100.0
+                        pricing::distance_pct(entry_price, sl_price)
                     );
+                    // Read it back from Binance and log what the EXCHANGE
+                    // stored, not what we asked for. This is the number the
+                    // client sees in the app, so it is the number that settles
+                    // any argument about whether the stop is correct.
+                    self.verify_stop_on_exchange(algo_id, entry_price, pct, quantity, &raw)
+                        .await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -639,6 +899,27 @@ impl TradingBot {
                                 );
                                 return Ok(());
                             }
+                            // If the nudge cannot actually move the level (it is
+                            // clamped to `target` and `target` is what was just
+                            // rejected), retrying is pointless — it would burn
+                            // all five attempts on the identical price and then
+                            // market-close a position that has NOT hit its
+                            // stop. Hold the configured level in software
+                            // instead.
+                            if (candidate - sl_price).abs() < self.filters.tick_size / 2.0
+                                || (candidate - last_attempted).abs()
+                                    < self.filters.tick_size / 2.0
+                            {
+                                self.software_stop_price = Some(self.round_to_tick(target));
+                                warn!(
+                                    "Binance keeps rejecting the stop at {trigger} and the level \
+                                     cannot be moved without going wider than the configured \
+                                     {pct}%. Holding the exact {pct}% level {} as a bot-side stop.",
+                                    self.format_price(target)
+                                );
+                                return Ok(());
+                            }
+                            last_attempted = sl_price;
                             sl_price = candidate;
                             warn!(
                                 "Stop loss at {trigger} rejected by Binance (last price {cur}). \
@@ -659,9 +940,108 @@ impl TradingBot {
             }
         }
 
-        error!("Could not place a stop loss after {max_retries} attempts — emergency closing.");
-        self.emergency_close().await;
+        // Out of attempts. Do NOT market-close: the price has not reached the
+        // stop (the `already_past` arm above handles that case), so closing
+        // here would realise a loss the user never asked for. Hold the exact
+        // configured level from the bot instead — it is enforced on every trade
+        // print, which is the same trigger the exchange order would have used.
+        self.software_stop_price = Some(self.round_to_tick(target));
+        error!(
+            "Binance rejected the stop {max_retries} times. Holding the configured {pct}% level {} \
+             as a bot-side stop — the position is still protected, but it depends on this process \
+             staying up. Check the log for the rejection reason.",
+            self.format_price(target)
+        );
         Ok(())
+    }
+
+    /// Read the stop back from Binance and log the trigger price the EXCHANGE
+    /// actually stored, plus the percentage that works out to.
+    ///
+    /// Computing the right number and sending the right number are two
+    /// different things, and only this call proves the second one. It is one
+    /// read on the non-latency-critical open path, and it turns "the bot says
+    /// 0.10% but Binance shows 0.62%" from an argument into a log line.
+    async fn verify_stop_on_exchange(
+        &self,
+        algo_id: i64,
+        entry_price: f64,
+        requested_pct: f64,
+        expected_qty: &str,
+        raw_response: &Value,
+    ) {
+        let orders = match self.rest.open_algo_orders(&self.config.symbol).await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("Could not read the stop back from Binance to verify it: {e}");
+                warn!("Raw response from placing the stop was: {raw_response}");
+                return;
+            }
+        };
+        let placed = orders
+            .iter()
+            .find(|o| get_i64(o, "algoId") == Some(algo_id));
+        let Some(o) = placed else {
+            warn!(
+                "Stop algoId {algo_id} was accepted but is not in the open algo orders list. \
+                 Raw response was: {raw_response}"
+            );
+            return;
+        };
+        // Binance names this field differently across responses.
+        let trigger = ["triggerPrice", "stopPrice", "price"]
+            .iter()
+            .map(|k| get_f64(o, k))
+            .find(|v| *v > 0.0)
+            .unwrap_or(0.0);
+        if trigger <= 0.0 {
+            warn!("Stop algoId {algo_id} is open but reported no trigger price. Order: {o}");
+            return;
+        }
+        let actual = pricing::distance_pct(entry_price, trigger);
+        let tolerance = self.filters.tick_size / entry_price * 100.0 + 1e-9;
+
+        // --- price ---
+        if (actual - requested_pct).abs() <= tolerance {
+            info!(
+                "VERIFIED on Binance: stop {trigger} is {actual:.4}% from entry {entry_price} \
+                 (configured {requested_pct}%, tolerance {tolerance:.4}% = one tick)"
+            );
+        } else {
+            error!(
+                "STOP MISMATCH on Binance: the exchange holds {trigger} = {actual:.4}% from entry \
+                 {entry_price}, but {requested_pct}% was configured. algoId {algo_id}."
+            );
+            error!("Raw response from placing this stop: {raw_response}");
+            error!("Order as Binance now holds it: {o}");
+        }
+
+        // --- quantity ---
+        // A stop for LESS than the position closes only part of it. The
+        // remainder is then blended into the next trade's entry price by
+        // Binance, and every stop after that is measured from a number the user
+        // never chose — a failure that looks perfect on the exchange right up
+        // until it fires. Cheap to check here, very hard to spot later.
+        let stop_qty = ["quantity", "origQty", "executedQty"]
+            .iter()
+            .map(|k| get_f64(o, k))
+            .find(|v| *v > 0.0)
+            .unwrap_or(0.0);
+        let want_qty = expected_qty.parse::<f64>().unwrap_or(0.0);
+        if stop_qty <= 0.0 {
+            // `closePosition`-style stops carry no quantity; that is fine.
+            info!("Stop {algo_id} reports no quantity field (order: {o})");
+        } else if want_qty > 0.0 && (stop_qty - want_qty).abs() > self.filters.step_size / 2.0 {
+            error!(
+                "STOP QUANTITY MISMATCH: the stop covers {stop_qty} but the position is \
+                 {want_qty}. If it fires, {:.8} would be left open with no stop behind it. \
+                 algoId {algo_id}.",
+                (want_qty - stop_qty).abs()
+            );
+            error!("Order as Binance now holds it: {o}");
+        } else {
+            info!("Stop quantity verified: {stop_qty} covers the full position ({expected_qty}).");
+        }
     }
 
     /// Cancel the exchange-side algo stop-loss (if any) and clear its id.
@@ -757,6 +1137,7 @@ impl TradingBot {
         }
         self.current_position = None;
         self.position_entry_price = None;
+        self.position_quantity = None;
     }
 
     // -----------------------------------------------------------------
@@ -783,6 +1164,7 @@ impl TradingBot {
             let previous = self.current_position.clone();
             self.current_position = None;
             self.position_entry_price = None;
+            self.position_quantity = None;
             self.software_stop_price = None;
             // Cancel the tracked algo stop: harmless (-2011) if it just fired,
             // but removes it if this close came from elsewhere (e.g. manual).
@@ -828,6 +1210,7 @@ impl TradingBot {
             info!("Take profit executed: {} for {}", o.side, o.symbol);
             self.current_position = None;
             self.position_entry_price = None;
+            self.position_quantity = None;
             self.software_stop_price = None;
             self.update_balance_and_stats().await;
             // Cancel ALL resting orders (regular + every algo stop) before stopping.
@@ -865,11 +1248,13 @@ impl TradingBot {
         };
         let mut actual: Option<String> = None;
         let mut actual_entry: Option<f64> = None;
+        let mut actual_qty: Option<f64> = None;
         for p in &positions {
             let amt = get_f64(p, "positionAmt");
             if amt != 0.0 {
                 actual = Some(if amt > 0.0 { "long" } else { "short" }.into());
                 actual_entry = Some(get_f64(p, "entryPrice"));
+                actual_qty = Some(amt.abs());
                 break;
             }
         }
@@ -880,6 +1265,7 @@ impl TradingBot {
             );
             self.current_position = actual.clone();
             self.position_entry_price = actual_entry;
+            self.position_quantity = actual_qty.map(|q| self.format_quantity(q));
         }
 
         // Orphan-order cleanup. With a position, there should be just the TP
@@ -901,7 +1287,15 @@ impl TradingBot {
                 let _ = self.rest.cancel_all_open_orders(&self.config.symbol).await;
                 self.cancel_all_algo_orders("re-arm with position").await;
                 self.ensure_position_orders().await;
+                return;
             }
+            // ...and exactly ONE algo stop, at the configured distance from
+            // this position's entry. This check did not exist: a stop left over
+            // from a previous trade would sit there for the life of the new
+            // position, triggering at the OLD entry's level. That is a stop at
+            // a percentage nobody configured, different on every trade —
+            // exactly the reported symptom, and invisible until it fires.
+            self.reconcile_stop_loss().await;
         } else {
             // No position → cancel ALL leftover orders: regular (TP) AND algo
             // (SL). This is what cleans up after a MANUAL close (client's
@@ -914,15 +1308,103 @@ impl TradingBot {
         }
     }
 
+    /// Verify the resting stop-loss still matches this position: exactly one
+    /// algo stop, at the configured percentage from the entry we opened at.
+    /// Anything else is repaired.
+    async fn reconcile_stop_loss(&mut self) {
+        // A bot-side software stop is a deliberate state (the exchange refused
+        // the level); it is enforced on every price tick and has no algo order.
+        if self.software_stop_price.is_some() {
+            return;
+        }
+        let (entry, is_long) = match (self.position_entry_price, self.current_position.as_deref()) {
+            (Some(e), Some("long")) if e > 0.0 => (e, true),
+            (Some(e), Some("short")) if e > 0.0 => (e, false),
+            _ => return,
+        };
+        let orders = match self.rest.open_algo_orders(&self.config.symbol).await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("Consistency check: could not list algo stops: {e}");
+                return;
+            }
+        };
+
+        let pct = self.config.stop_loss_percentage;
+        let tolerance = self.filters.tick_size / entry * 100.0 + 1e-9;
+        let mut wrong = Vec::new();
+        for o in &orders {
+            let trigger = ["triggerPrice", "stopPrice", "price"]
+                .iter()
+                .map(|k| get_f64(o, k))
+                .find(|v| *v > 0.0)
+                .unwrap_or(0.0);
+            let right_side = if is_long { trigger < entry } else { trigger > entry };
+            let dist = pricing::distance_pct(entry, trigger);
+            if trigger <= 0.0 || !right_side || (dist - pct).abs() > tolerance {
+                wrong.push((get_i64(o, "algoId"), trigger, dist));
+            }
+        }
+
+        if orders.len() == 1 && wrong.is_empty() {
+            return; // exactly what it should be
+        }
+        if orders.is_empty() {
+            warn!("Position has NO stop loss on the exchange — placing it now.");
+        } else {
+            for (id, trigger, dist) in &wrong {
+                warn!(
+                    "Stale/incorrect stop {id:?} at {trigger} = {dist:.4}% from entry {entry}, \
+                     but {pct}% is configured — replacing it."
+                );
+            }
+            if orders.len() > 1 {
+                warn!("{} stop orders on one position — only one may exist.", orders.len());
+            }
+        }
+        self.cancel_all_algo_orders("stop-loss reconcile").await;
+        let quantity = match self.position_quantity.clone() {
+            Some(q) => q,
+            None => match self.calculate_quantity(entry) {
+                Ok(q) => q,
+                Err(e) => {
+                    error!("Stop-loss reconcile: cannot size the order: {e}");
+                    return;
+                }
+            },
+        };
+        if let Err(e) = self
+            .place_stop_loss(entry, &quantity, "position entryPrice (reconcile)")
+            .await
+        {
+            error!("Stop-loss reconcile: re-place failed: {e}");
+        }
+    }
+
     async fn ensure_position_orders(&mut self) {
         let entry = match self.position_entry_price {
             Some(e) => e,
             None => return,
         };
-        if let Err(e) = self.place_take_profit(entry).await {
+        // Close exactly what is open. Recomputing the size from the price can
+        // floor to a different step and leave a sliver of the position behind.
+        let quantity = match self.position_quantity.clone() {
+            Some(q) => q,
+            None => match self.calculate_quantity(entry) {
+                Ok(q) => q,
+                Err(e) => {
+                    error!("Re-place TP/SL: cannot size the order: {e}");
+                    return;
+                }
+            },
+        };
+        if let Err(e) = self.place_take_profit(entry, &quantity).await {
             error!("Re-place TP failed: {e}");
         }
-        if let Err(e) = self.place_stop_loss(entry).await {
+        if let Err(e) = self
+            .place_stop_loss(entry, &quantity, "position entryPrice (re-place)")
+            .await
+        {
             error!("Re-place SL failed: {e}");
         }
     }
@@ -938,6 +1420,21 @@ impl TradingBot {
                 " - Price: {price} ({change:+.2}% from ref {:?})",
                 self.entry_price
             ));
+            // The mark/last gap is the thing that used to corrupt stop
+            // distances on thin symbols. Showing it makes that visible instead
+            // of leaving it to be inferred from a bad stop.
+            if let Some(mark) = self.mark_price {
+                let gap = pricing::distance_pct(price, mark);
+                if gap > 0.05 {
+                    line.push_str(&format!(" - Mark: {mark} ({gap:.2}% from last)"));
+                }
+            }
+            if let (Some(sl), Some(entry)) = (self.software_stop_price, self.position_entry_price) {
+                line.push_str(&format!(
+                    " - BOT-SIDE stop at {sl} ({:.4}% from entry {entry})",
+                    pricing::distance_pct(entry, sl)
+                ));
+            }
             if self.use_custom_entry && self.current_position.is_none() {
                 line.push_str(&format!(
                     " - Waiting for range LOW={:?}/HIGH={:?}",
@@ -1031,17 +1528,16 @@ impl TradingBot {
         Ok(formatted)
     }
 
+    // These two are thin wrappers over `pricing` on purpose: there is exactly
+    // ONE implementation of the tick grid and ONE of price formatting in this
+    // codebase, and both are unit-tested in `pricing.rs`. A second copy is how
+    // a fix gets applied to one order type and not the other.
     fn round_to_tick(&self, price: f64) -> f64 {
-        let t = self.filters.tick_size;
-        if t <= 0.0 {
-            price
-        } else {
-            (price / t).round() * t
-        }
+        pricing::round_to_tick(price, self.filters.tick_size)
     }
 
     fn format_price(&self, price: f64) -> String {
-        format!("{:.*}", self.filters.price_precision, price)
+        pricing::format_price(price, self.filters.price_precision)
     }
 
     fn format_quantity(&self, qty: f64) -> String {
@@ -1077,6 +1573,7 @@ impl TradingBot {
             }
             self.current_position = None;
             self.position_entry_price = None;
+            self.position_quantity = None;
         }
         let _ = self.rest.close_listen_key().await;
         info!("Bot stopped");
