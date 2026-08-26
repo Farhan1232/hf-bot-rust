@@ -46,7 +46,7 @@ PART 3 — Connect to the server (EASIEST way, no key needed)
 ===================================================================
 PART 4 — Put the bot on the server and run it
 ===================================================================
-(Do this in that black browser terminal. Ask Farhan/Claude for the file-copy
+(Do this in that black browser terminal. Ask Farhan for the file-copy
 command — it depends on how the zip gets there. Once the folder is on the
 server:)
    cd hf-bot-rust
